@@ -5,49 +5,47 @@ A small Go daemon that inspects the TLS SNI during the handshake and routes inco
 With that router you can use 1 server for hosting multiples vless-reality servers. Actual for Russia-specific censorship.
 
 ## Visual block-scheme
-          ┌──────────────────────┐
-          │      CLIENTS         │
-          │                      │
-          │  SNI = a.example.com │
-          │  SNI = b.example.com │
-          │  SNI = c.example.com │
-          └─────────┬────────────┘
-                    │
-                    │ TCP :443
-                    ▼
-        ┌───────────────────────────────┐
-        │        PUBLIC IP              │
-        │        66.xxx.xxx.xx          │
-        │                               │
-        │   x-ui-sni-router (Go)        │
-        │   ────────────────────────    │
-        │   • accept(:443)              │
-        │   • read ClientHello          │
-        │   • extract SNI               │
-        │   • lookup table              │
-        │   • raw TCP proxy             │
-        └───────────┬───────┬───────── ─┘
-                    │       │
-          ┌─────────┘       └─────────┐
-          ▼                           ▼
-┌───────────────────┐       ┌───────────────────┐
-│ xray reality A    │       │ xray reality B    │
-│ listen 127.0.0.1  │       │ listen 127.0.0.1  │
-│ port 55555        │       │ port 55556        │
-│                   │       │                   │
-│ SNI=a.example.com │       │ SNI=b.example.com │
-└───────────────────┘       └───────────────────┘
-                    ▲
-                    │
-          ┌─────────┴─────────┐
-          ▼                   ▼
-┌───────────────────┐   ┌───────────────────┐
-│ xray reality C    │   │ (other inbound)   │
-│ port 55557        │   │                   │
-│ SNI=c.example.com │   │                   │
-└───────────────────┘   └───────────────────┘
-
-
+                    ┌──────────────────────┐
+                    │      CLIENTS         │
+                    │                      │
+                    │  SNI = a.example.com │
+                    │  SNI = b.example.com │
+                    │  SNI = c.example.com │
+                    └─────────┬────────────┘
+                              │
+                              │ TCP :443
+                              ▼
+                  ┌───────────────────────────────┐
+                  │        PUBLIC IP              │
+                  │        66.xxx.xxx.xx          │
+                  │                               │
+                  │   x-ui-sni-router (Go)        │
+                  │   ────────────────────────    │
+                  │   • accept(:443)              │
+                  │   • read ClientHello          │
+                  │   • extract SNI               │
+                  │   • lookup table              │
+                  │   • raw TCP proxy             │
+                  └───────────┬───────┬───────── ─┘
+                              │       │
+                    ┌─────────┘       └─────────┐
+                    ▼                           ▼
+          ┌───────────────────┐       ┌───────────────────┐
+          │ xray reality A    │       │ xray reality B    │
+          │ listen 127.0.0.1  │       │ listen 127.0.0.1  │
+          │ port 55555        │       │ port 55556        │
+          │                   │       │                   │
+          │ SNI=a.example.com │       │ SNI=b.example.com │
+          └───────────────────┘       └───────────────────┘
+                              ▲
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+          ┌───────────────────┐   ┌───────────────────┐
+          │ xray reality C    │   │ (other inbound)   │
+          │ port 55557        │   │                   │
+          │ SNI=c.example.com │   │                   │
+          └───────────────────┘   └───────────────────┘
 
 ## Highlights
 - Route incoming TLS connections by SNI at Layer 4 (no TLS termination).
