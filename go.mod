@@ -1,4 +1,4 @@
-module x-ui_l4_demultiplex
+module x-ui-sni-router
 
 go 1.24.4
 
