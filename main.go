@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -8,6 +9,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,7 +33,7 @@ var (
 	routes atomic.Value
 )
 
-func getInbounds(conn *sql.DB) (RouteTable, error) {
+func getInbounds(conn *sql.DB, configPath string) (RouteTable, error) {
 	rows, err := conn.Query("SELECT port, stream_settings FROM inbounds")
 	if err != nil {
 		return nil, err
@@ -51,7 +55,6 @@ func getInbounds(conn *sql.DB) (RouteTable, error) {
 			continue
 		}
 
-		// parse host & port from json
 		host, _, err := net.SplitHostPort(settings.RealitySettings.Target)
 		if err != nil {
 			log.Printf("[WARN] error splitting host and port; trying to use the field as the host")
@@ -62,11 +65,47 @@ func getInbounds(conn *sql.DB) (RouteTable, error) {
 			newRoutes[host] = port
 		}
 	}
+
+	file, err := os.Open(configPath)
+	if err != nil {
+		log.Printf("[INFO] custom config file not found or couldn't be opened: %v", err)
+		return newRoutes, nil
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			log.Printf("[WARN] invalid line in config: %s", line)
+			continue
+		}
+
+		host := parts[0]
+		port, err := strconv.Atoi(parts[1])
+		if err != nil {
+			log.Printf("[WARN] invalid port in config for host %s: %v", host, err)
+			continue
+		}
+
+		newRoutes[host] = port
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
 	return newRoutes, nil
 }
 
 func reloadInbounds(conn *sql.DB) error {
-	newRoutes, err := getInbounds(conn)
+	newRoutes, err := getInbounds(conn, "config")
 	if err != nil {
 		return err
 	}
