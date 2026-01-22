@@ -104,8 +104,8 @@ func getInbounds(conn *sql.DB, configPath string) (RouteTable, error) {
 	return newRoutes, nil
 }
 
-func reloadInbounds(conn *sql.DB) error {
-	newRoutes, err := getInbounds(conn, "config")
+func reloadInbounds(conn *sql.DB, configPath string) error {
+	newRoutes, err := getInbounds(conn, configPath)
 	if err != nil {
 		return err
 	}
@@ -196,6 +196,7 @@ func handleConn(c net.Conn) {
 
 func main() {
 	dbPath := flag.String("db_path", "/etc/x-ui/x-ui.db", "path to x-ui database")
+	configPath := flag.String("config_path", "/usr/local/bin/x-ui-sni-router/config", "path to config")
 	flag.Parse()
 
 	conn, err := sql.Open("sqlite3", *dbPath)
@@ -205,7 +206,7 @@ func main() {
 	defer conn.Close()
 
 	// read & parse x-ui inbounds to memory cached table
-	if err := reloadInbounds(conn); err != nil {
+	if err := reloadInbounds(conn, *configPath); err != nil {
 		log.Fatalf("Initial DB load failed: %v", err)
 	}
 
@@ -214,7 +215,7 @@ func main() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			if err := reloadInbounds(conn); err != nil {
+			if err := reloadInbounds(conn, *configPath); err != nil {
 				log.Printf("[ERROR] reload failed: %v", err)
 			}
 		}
