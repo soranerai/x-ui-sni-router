@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -10,8 +9,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,111 +17,125 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-type RealitySettins struct {
+// Структуры для JSON конфига
+type ConfigRoute struct {
+	SNI       string `json:"sni"`
+	LocalPort int    `json:"local_port"`
+}
+
+type JSONConfig struct {
+	Routes                   []ConfigRoute `json:"routes"`
+	DefaultFallbackLocalPort int           `json:"default_fallback_local_port"`
+}
+
+// Вспомогательные структуры для x-ui DB
+type RealitySettings struct {
 	Target string `json:"target"`
 }
 
 type StreamSettings struct {
-	RealitySettings RealitySettins `json:"realitySettings"`
+	RealitySettings RealitySettings `json:"realitySettings"`
 }
+
 type RouteTable map[string]int
 
+// RouterState хранит текущее состояние маршрутизации
+type RouterState struct {
+	Routes       RouteTable
+	FallbackPort int
+}
+
 var (
-	routes atomic.Value
+	// Используем atomic.Value для хранения структуры RouterState
+	routerState atomic.Value
 )
 
-func getInbounds(conn *sql.DB, configPath string) (RouteTable, error) {
-	rows, err := conn.Query("SELECT port, stream_settings FROM inbounds")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
+func getInbounds(conn *sql.DB, configPath string) (*RouterState, error) {
 	newRoutes := make(RouteTable)
+	var fallbackPort int
 
-	for rows.Next() {
-		var port int
-		var settingsRaw string
-		if err := rows.Scan(&port, &settingsRaw); err != nil {
-			return nil, err
-		}
+	// 1. Читаем из базы x-ui
+	rows, err := conn.Query("SELECT port, stream_settings FROM inbounds")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var port int
+			var settingsRaw string
+			if err := rows.Scan(&port, &settingsRaw); err != nil {
+				continue
+			}
 
-		var settings StreamSettings
-		if err := json.Unmarshal([]byte(settingsRaw), &settings); err != nil {
-			log.Printf("[WARN] skipping inbound with bad json: %v", err)
-			continue
+			var settings StreamSettings
+			if err := json.Unmarshal([]byte(settingsRaw), &settings); err == nil {
+				host, _, err := net.SplitHostPort(settings.RealitySettings.Target)
+				if err != nil {
+					host = settings.RealitySettings.Target
+				}
+				if host != "" {
+					newRoutes[host] = port
+				}
+			}
 		}
-
-		host, _, err := net.SplitHostPort(settings.RealitySettings.Target)
-		if err != nil {
-			log.Printf("[WARN] error splitting host and port; trying to use the field as the host")
-			host = settings.RealitySettings.Target
-		}
-
-		if host != "" {
-			newRoutes[host] = port
-		}
+	} else {
+		log.Printf("[WARN] could not query sqlite: %v", err)
 	}
 
-	file, err := os.Open(configPath)
+	// 2. Читаем JSON конфиг
+	jsonData, err := os.ReadFile(configPath)
 	if err != nil {
-		log.Printf("[INFO] custom config file not found or couldn't be opened: %v", err)
-		return newRoutes, nil
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+		log.Printf("[INFO] custom JSON config not found: %v", err)
+	} else {
+		var cfg JSONConfig
+		if err := json.Unmarshal(jsonData, &cfg); err != nil {
+			log.Printf("[ERROR] failed to parse JSON config: %v", err)
+		} else {
+			// Добавляем роуты из JSON (они могут перезаписать данные из БД)
+			for _, r := range cfg.Routes {
+				newRoutes[r.SNI] = r.LocalPort
+			}
+			fallbackPort = cfg.DefaultFallbackLocalPort
 		}
-
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			log.Printf("[WARN] invalid line in config: %s", line)
-			continue
-		}
-
-		host := parts[0]
-		port, err := strconv.Atoi(parts[1])
-		if err != nil {
-			log.Printf("[WARN] invalid port in config for host %s: %v", host, err)
-			continue
-		}
-
-		newRoutes[host] = port
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return newRoutes, nil
+	return &RouterState{
+		Routes:       newRoutes,
+		FallbackPort: fallbackPort,
+	}, nil
 }
 
 func reloadInbounds(conn *sql.DB, configPath string) error {
-	newRoutes, err := getInbounds(conn, configPath)
+	state, err := getInbounds(conn, configPath)
 	if err != nil {
 		return err
 	}
 
-	routes.Store(newRoutes)
-
-	log.Printf("[INFO] route table updated: %d entries", len(newRoutes))
+	routerState.Store(state)
+	log.Printf("[INFO] route table updated: %d entries, fallback port: %d", len(state.Routes), state.FallbackPort)
 	return nil
 }
 
+// getPort теперь всегда возвращает порт (либо из таблицы, либо fallback)
 func getPort(sni string) (int, bool) {
-	val := routes.Load()
+	val := routerState.Load()
 	if val == nil {
 		return 0, false
 	}
-	rt := val.(RouteTable)
-	port, ok := rt[sni]
-	return port, ok
+	state := val.(*RouterState)
+
+	port, ok := state.Routes[sni]
+	if ok {
+		return port, true
+	}
+
+	// Если SNI не найден, но задан fallback порт
+	if state.FallbackPort > 0 {
+		return state.FallbackPort, true
+	}
+
+	return 0, false
 }
+
+// --- Остальная часть кода (proxyConn, handleConn, main) остается практически без изменений ---
 
 type writeCloser interface {
 	CloseWrite() error
@@ -155,32 +166,22 @@ func proxyConn(src, dst net.Conn) {
 
 func handleConn(c net.Conn) {
 	defer c.Close()
-
-	// handshake timeout
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	vhostConn, err := vhost.TLS(c)
 	if err != nil {
-		log.Printf("[DEBUG] not a TLS connection from %s: %v", c.RemoteAddr(), err)
 		return
 	}
-
-	// resets deadline after sni parsed
 	c.SetDeadline(time.Time{})
 
 	sni := vhostConn.Host()
-	if sni == "" {
-		log.Printf("[WARN] %s: no SNI found", c.RemoteAddr())
-		return
-	}
-
 	backendPort, found := getPort(sni)
+
 	if !found {
-		log.Printf("[WARN] %s: no route for SNI %s", c.RemoteAddr(), sni)
+		log.Printf("[WARN] %s: no route and no fallback for SNI %s", c.RemoteAddr(), sni)
 		return
 	}
 
-	// init connection to local vless-reality server
 	backendAddr := fmt.Sprintf("127.0.0.1:%d", backendPort)
 	bc, err := net.DialTimeout("tcp", backendAddr, 3*time.Second)
 	if err != nil {
@@ -190,13 +191,13 @@ func handleConn(c net.Conn) {
 	defer bc.Close()
 
 	log.Printf("[INFO] %s -> SNI:%s -> %s", c.RemoteAddr(), sni, backendAddr)
-
 	proxyConn(vhostConn, bc)
 }
 
 func main() {
 	dbPath := flag.String("db_path", "/etc/x-ui/x-ui.db", "path to x-ui database")
-	configPath := flag.String("config_path", "/usr/local/bin/x-ui-sni-router/config", "path to config")
+	// По умолчанию ожидаем json
+	configPath := flag.String("config_path", "/usr/local/bin/x-ui-sni-router/config.json", "path to JSON config")
 	flag.Parse()
 
 	conn, err := sql.Open("sqlite3", *dbPath)
@@ -205,19 +206,14 @@ func main() {
 	}
 	defer conn.Close()
 
-	// read & parse x-ui inbounds to memory cached table
 	if err := reloadInbounds(conn, *configPath); err != nil {
-		log.Fatalf("Initial DB load failed: %v", err)
+		log.Fatalf("Initial config load failed: %v", err)
 	}
 
-	// ticker for auto-renew cache
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
 		for range ticker.C {
-			if err := reloadInbounds(conn, *configPath); err != nil {
-				log.Printf("[ERROR] reload failed: %v", err)
-			}
+			reloadInbounds(conn, *configPath)
 		}
 	}()
 
@@ -226,20 +222,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Println("Server started on :443 (SNI Proxy)")
+	log.Println("Server started on :443")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			log.Printf("[ERROR] accept error: %v", err)
 			continue
 		}
-
-		// handle incoming connection
 		go handleConn(conn)
 	}
 }
